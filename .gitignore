@@ -1,0 +1,18 @@
+# Sensitive data
+cards.json
+
+# Build outputs
+bin/
+obj/
+
+# User-specific files
+*.user
+*.suo
+.vs/
+
+# Rider/JetBrains
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

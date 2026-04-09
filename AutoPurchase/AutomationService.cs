@@ -11,7 +11,7 @@ public class AutomationService
     {
         try
         {
-            using var playwright = await Playwright.CreateAsync();
+            var playwright = await Playwright.CreateAsync();
 
             var tempProfileDir = Path.Combine(Path.GetTempPath(), "chrome-autopurchase-" + Guid.NewGuid().ToString("N"));
 
@@ -26,7 +26,7 @@ public class AutomationService
                 }
             });
 
-            var page = await context.NewPageAsync();
+            var page = context.Pages.Count > 0 ? context.Pages[0] : await context.NewPageAsync();
 
             await page.GotoAsync("https://www.tiktok.com/coin");
 
@@ -60,6 +60,8 @@ public class AutomationService
             // Lấy tất cả element có data-e2e bắt đầu bằng wallet-package-coin-num-
             var coinElements = await page.QuerySelectorAllAsync("[data-e2e^='wallet-package-coin-num-']");
             var priceElements = await page.QuerySelectorAllAsync("[data-e2e^='wallet-package-price-']");
+            var userNameElement = await page.QuerySelectorAsync("[data-e2e^='wallet-user-name']");
+            var userName = userNameElement != null ? await userNameElement.InnerTextAsync() : "unknown";
 
             var coinList = new List<int>();
             var priceList = new List<int>();
@@ -135,7 +137,7 @@ public class AutomationService
             await cardOption.ClickAsync();
 
             // Đợi 5 giây cho payment frame load
-            await page.WaitForTimeoutAsync(5000);
+            await page.WaitForTimeoutAsync(2000);
 
             var paymentFrame = page.FrameLocator("iframe[src*='pipo_checkouts']");
 
@@ -176,17 +178,145 @@ public class AutomationService
             await payButton.WaitForAsync();
             await payButton.ClickAsync();
 
-            var resultModal = page.Locator("[data-e2e='recharge-end-result-page']");
-            await resultModal.WaitForAsync(new() { Timeout = 120000 }); // 2 minutes for OTP/3D Secure
-            var closeBtn = resultModal.Locator("span.cursor-pointer");
-            await closeBtn.WaitForAsync();
-            await closeBtn.ClickAsync();
+            await HandlePaymentResultAsync(page);
 
-            await context.CloseAsync();
+            await TakeScreenshotAsync(page);
+            
+            await page.WaitForTimeoutAsync(2000);
+            
+            // Chrome keeps session data (cookies, login tokens) in memory while running. It only flushes them to disk when the browser closes gracefully.                                                                                      
+            //                                                                                                                                                                                                                        
+            //     If you copy the profile while Chrome is still open:
+            // - The Cookies SQLite file may be incomplete or mid-write                                                                                                                                                                         
+            //     - Login session tokens haven't been persisted yet                                                                                                                                                                              
+            //     - Some files are still locked by the Chrome process, causing copy failures
+            //
+            // context.CloseAsync() forces Chrome to:
+            // 1. Write all cookies/session data to disk
+            // 2. Release file locks on profile files
+            //
+            //     Without it → profile is copied before login is saved → opening the shortcut shows logged-out TikTok.
+            await context.CloseAsync(); // flush cookies/session to disk before copying profile, disk save 
+            
+            await SaveProfileAsync(tempProfileDir, userName);
         }
         catch (Exception e)
         {
             Console.WriteLine(e);
         }
+    }
+
+    // Detects which case after Pay: A = direct result, B = OTP required
+    private static async Task HandlePaymentResultAsync(IPage page)
+    {
+        var resultModalTask = page.WaitForSelectorAsync(
+            "[data-e2e='recharge-end-result-page']",
+            new PageWaitForSelectorOptions { Timeout = 120000 });
+
+        var otpInputTask = page.WaitForSelectorAsync(
+            "#radioContainer",
+            new PageWaitForSelectorOptions { Timeout = 120000 });
+
+        var winner = await Task.WhenAny(resultModalTask, otpInputTask);
+
+        if (winner == otpInputTask)
+            await HandleOtpAsync(page);
+        else
+            await HandleDirectResultAsync(page);
+    }
+
+    // Case A: no OTP — payment succeeded or failed immediately
+    private static async Task HandleDirectResultAsync(IPage page)
+    {
+        var resultModal = page.Locator("[data-e2e='recharge-end-result-page']");
+        await resultModal.WaitForAsync(new() { State = WaitForSelectorState.Visible });
+
+        var closeBtn = resultModal.Locator("span.cursor-pointer");
+        await closeBtn.WaitForAsync(new() { State = WaitForSelectorState.Visible });
+        await closeBtn.ClickAsync();
+        await page.EvaluateAsync("window.scrollTo(0, 0)");
+    }
+
+    // Case B: OTP required — auto-select SMS, click Continue, then wait for user to enter OTP
+    private static async Task HandleOtpAsync(IPage page)
+    {
+        Console.WriteLine("OTP required — selecting SMS method...");
+
+        // Select SMS radio option
+        var smsRadio = page.Locator("input[name='method'][value='OTP_SMS']");
+        await smsRadio.WaitForAsync(new() { State = WaitForSelectorState.Visible });
+        await smsRadio.CheckAsync();
+
+        // Click Continue to send SMS OTP
+        var continueBtn = page.Locator("button#btnSubmit");
+        await continueBtn.WaitForAsync(new() { State = WaitForSelectorState.Visible });
+        await continueBtn.ClickAsync();
+        Console.WriteLine("SMS OTP sent — waiting for user to enter OTP...");
+
+        // Wait until the result modal appears after user submits OTP (up to 3 minutes)
+        var resultModal = page.Locator("[data-e2e='recharge-end-result-page']");
+        await resultModal.WaitForAsync(new() { Timeout = 180000 });
+
+        var closeBtn = resultModal.Locator("span.cursor-pointer");
+        await closeBtn.WaitForAsync(new() { State = WaitForSelectorState.Visible });
+        await closeBtn.ClickAsync();
+        await page.EvaluateAsync("window.scrollTo(0, 0)");
+    }
+
+    private static async Task TakeScreenshotAsync(IPage page)
+    {
+        var screenshotDir = @"C:\Users\Ngs-MT1694\Desktop\TransactionInfo\ScreenShoot";
+        Directory.CreateDirectory(screenshotDir);
+        var screenshotPath = Path.Combine(screenshotDir, $"result_{DateTime.Now:yyyyMMdd_HHmmss}.png");
+        var viewportSize = page.ViewportSize;
+        var clipHeight = (viewportSize?.Height ?? 900) / 3;
+        var clipWidth = viewportSize?.Width ?? 1280;
+        await page.ScreenshotAsync(new() { Path = screenshotPath, FullPage = false, Clip = new Clip { X = 0, Y = 0, Width = clipWidth, Height = clipHeight } });
+        Console.WriteLine($"Screenshot saved: {screenshotPath}");
+    }
+
+    private static async Task SaveProfileAsync(string tempProfileDir, string userName)
+    {
+        var safeName = string.Concat(userName.Split(Path.GetInvalidFileNameChars()));
+        var profileRoot = @"C:\Users\Ngs-MT1694\Desktop\TransactionInfo\Profile";
+        var profileDest = Path.Combine(profileRoot, safeName);
+        if (Directory.Exists(profileDest)) Directory.Delete(profileDest, recursive: true);
+        CopyDirectory(tempProfileDir, profileDest);
+        Console.WriteLine($"Profile saved: {profileDest}");
+
+        var lnkPath = Path.Combine(profileRoot, $"{safeName}.lnk");
+        var chromeExe = @"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        var chromeArgs = $"--user-data-dir=\"{profileDest}\" \"https://www.tiktok.com/coin\"";
+        var chromeDir = Path.GetDirectoryName(chromeExe)!;
+        var psScript = $"""
+            $s = (New-Object -ComObject WScript.Shell).CreateShortcut("{lnkPath}")
+            $s.TargetPath = "{chromeExe}"
+            $s.Arguments = '{chromeArgs}'
+            $s.IconLocation = "{chromeExe}, 0"
+            $s.WorkingDirectory = "{chromeDir}"
+            $s.Save()
+            """;
+        var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(psScript));
+        using var ps = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-NoProfile -NonInteractive -EncodedCommand {encoded}",
+            UseShellExecute = false,
+            CreateNoWindow = true
+        })!;
+        await ps.WaitForExitAsync();
+        Console.WriteLine($"Shortcut saved: {lnkPath}");
+    }
+
+    private static void CopyDirectory(string source, string dest)
+    {
+        Directory.CreateDirectory(dest);
+        foreach (var file in Directory.GetFiles(source))
+        {
+            try { File.Copy(file, Path.Combine(dest, Path.GetFileName(file)), overwrite: true); }
+            catch { /* skip locked files */ }
+        }
+        foreach (var dir in Directory.GetDirectories(source))
+            CopyDirectory(dir, Path.Combine(dest, Path.GetFileName(dir)));
     }
 }
